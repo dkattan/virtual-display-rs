@@ -108,6 +108,69 @@ impl Client {
         Ok(())
     }
 
+    /// Start recording frames from specified monitors.
+    ///
+    /// If `monitor_ids` is empty, all monitors will be recorded.
+    pub async fn start_recording(&self, monitor_ids: Vec<Id>) -> Result<(), error::SendError> {
+        let command = DriverCommand::StartRecording { monitor_ids, output_path: None, fps: None };
+
+        send_command(&self.shared.client, &command).await?;
+        Ok(())
+    }
+
+    /// Stop recording frames.
+    pub async fn stop_recording(&self) -> Result<(), error::SendError> {
+        let command = DriverCommand::StopRecording;
+
+        send_command(&self.shared.client, &command).await?;
+        Ok(())
+    }
+
+    /// Request the current recording state.
+    ///
+    /// Returns [error::RequestError::Timeout] if the driver does not respond within 5
+    /// seconds.
+    pub async fn request_recording_state(
+        &self,
+    ) -> Result<(bool, Vec<Id>, Vec<String>), error::RequestError> {
+        use broadcast::error::RecvError;
+
+        let mut rx = self.command_rx.resubscribe();
+
+        send_command(&self.shared.client, &RequestCommand::RecordingState).await?;
+
+        let fut = async {
+            loop {
+                match rx.recv().await {
+                    Ok(Ok(ClientCommand::Reply(ReplyCommand::RecordingState {
+                        active,
+                        monitor_ids,
+                        shm_names,
+                    }))) => break Ok((active, monitor_ids, shm_names)),
+                    Ok(Err(e)) => break Err(error::RequestError::Receive(e.0.clone())),
+                    Ok(_) => continue,
+                    Err(RecvError::Lagged(_n)) => continue,
+                    Err(RecvError::Closed) => {
+                        match self.shared.receive_error.read().await.as_ref() {
+                            Some(e) => break Err(error::RequestError::Receive(e.clone())),
+                            None => {
+                                break Err(error::RequestError::Receive(Arc::new(io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "Pipe closed",
+                                ))))
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        match timeout(Duration::from_secs(5), fut).await {
+            Ok(result) => result,
+            Err(_) => Err(error::RequestError::Timeout(Duration::from_secs(5))),
+        }
+    }
+
     /// Request the current state of the driver.
     ///
     /// Returns [IpcError::Timeout] if the driver does not respond within 5

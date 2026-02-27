@@ -135,6 +135,7 @@ impl MockServer {
                 self.state.clear();
                 true
             }
+            _ => false,
         };
 
         if changed {

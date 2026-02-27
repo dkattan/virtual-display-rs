@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     mem::size_of,
     ptr::{addr_of_mut, NonNull},
     sync::{LazyLock, Mutex, OnceLock},
@@ -6,8 +7,8 @@ use std::{
 };
 
 use driver_ipc::{
-    Dimen, DriverCommand, EventCommand, Mode, Monitor, RefreshRate, ReplyCommand, RequestCommand,
-    ServerCommand,
+    Dimen, DriverCommand, EventCommand, Mode, Monitor, RefreshRate, ReplyCommand,
+    RequestCommand, ServerCommand,
 };
 use log::{error, warn};
 use tokio::{
@@ -31,6 +32,28 @@ use crate::context::DeviceContext;
 pub static ADAPTER: OnceLock<AdapterObject> = OnceLock::new();
 pub static MONITOR_MODES: LazyLock<Mutex<Vec<MonitorObject>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+pub static RECORDING_STATE: LazyLock<Mutex<RecordingState>> =
+    LazyLock::new(|| Mutex::new(RecordingState::default()));
+
+#[derive(Debug, Default)]
+pub struct RecordingState {
+    pub active: bool,
+    pub monitor_ids: HashSet<u32>,
+}
+
+impl RecordingState {
+    pub fn is_recording(&self, monitor_id: u32) -> bool {
+        self.active && (self.monitor_ids.is_empty() || self.monitor_ids.contains(&monitor_id))
+    }
+
+    pub fn shm_names(&self) -> Vec<String> {
+        let lock = MONITOR_MODES.lock().unwrap();
+        lock.iter()
+            .filter(|m| self.is_recording(m.data.id))
+            .map(|m| format!("Global\\VDD_Frame_{}", m.data.id))
+            .collect()
+    }
+}
 
 #[derive(Debug)]
 pub struct AdapterObject(pub NonNull<IDDCX_ADAPTER__>);
@@ -67,9 +90,16 @@ async fn process_message(
             continue;
         };
 
+        // Strip UTF-8 BOM if present (PowerShell StreamWriter adds it)
+        let msg = msg.trim_start_matches('\u{FEFF}');
+
         let Ok(command) = serde_json::from_str::<ServerCommand>(msg) else {
+            crate::swap_chain_processor::trace_log(&format!(
+                "IPC: failed to deserialize message: {msg}"
+            ));
             continue;
         };
+        crate::swap_chain_processor::trace_log(&format!("IPC: received command: {command:?}"));
 
         match command {
             // driver commands
@@ -90,6 +120,26 @@ async fn process_message(
                 DriverCommand::RemoveAll => {
                     remove_all();
                     _ = tx.send((id, Vec::new()));
+                }
+
+                DriverCommand::StartRecording { monitor_ids, output_path: _output_path, fps: _fps } => {
+                    crate::swap_chain_processor::trace_log(&format!(
+                        "IPC: StartRecording monitor_ids={monitor_ids:?}"
+                    ));
+                    let mut state = RECORDING_STATE.lock().unwrap();
+                    state.active = true;
+                    state.monitor_ids = monitor_ids.into_iter().collect();
+                    crate::swap_chain_processor::trace_log(&format!(
+                        "IPC: RecordingState now active={}, monitors={:?}",
+                        state.active, state.monitor_ids
+                    ));
+                }
+
+                DriverCommand::StopRecording => {
+                    crate::swap_chain_processor::trace_log("IPC: StopRecording");
+                    let mut state = RECORDING_STATE.lock().unwrap();
+                    state.active = false;
+                    state.monitor_ids.clear();
                 }
 
                 _ => (),
@@ -114,6 +164,30 @@ async fn process_message(
 
                 if server.write_all(data.as_bytes()).await.is_err() {
                     // a server error means we should completely stop trying
+                    return Err(());
+                }
+            }
+
+            ServerCommand::Request(RequestCommand::RecordingState) => {
+                let mut data = {
+                    let state = RECORDING_STATE.lock().unwrap();
+                    let command = ReplyCommand::RecordingState {
+                        active: state.active,
+                        monitor_ids: state.monitor_ids.iter().copied().collect(),
+                        shm_names: state.shm_names(),
+                    };
+
+                    let Ok(serialized) = serde_json::to_string(&command) else {
+                        error!("Command::Request - failed to serialize recording state reply");
+                        break;
+                    };
+
+                    serialized
+                };
+
+                data.push(EOF);
+
+                if server.write_all(data.as_bytes()).await.is_err() {
                     return Err(());
                 }
             }
