@@ -108,11 +108,30 @@ impl Client {
         Ok(())
     }
 
-    /// Start recording frames from specified monitors.
+    /// Start recording frames from specified monitors to shared memory.
     ///
     /// If `monitor_ids` is empty, all monitors will be recorded.
     pub async fn start_recording(&self, monitor_ids: Vec<Id>) -> Result<(), error::SendError> {
         let command = DriverCommand::StartRecording { monitor_ids, output_path: None, fps: None };
+
+        send_command(&self.shared.client, &command).await?;
+        Ok(())
+    }
+
+    /// Start recording frames to an MP4 file at the specified path.
+    ///
+    /// If `monitor_ids` is empty, all monitors will be recorded.
+    pub async fn start_recording_to_file(
+        &self,
+        monitor_ids: Vec<Id>,
+        output_path: String,
+        fps: u32,
+    ) -> Result<(), error::SendError> {
+        let command = DriverCommand::StartRecording {
+            monitor_ids,
+            output_path: Some(output_path),
+            fps: Some(fps),
+        };
 
         send_command(&self.shared.client, &command).await?;
         Ok(())

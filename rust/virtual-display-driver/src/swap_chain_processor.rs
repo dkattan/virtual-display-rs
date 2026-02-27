@@ -331,12 +331,6 @@ impl SwapChainProcessor {
                 let dst_stride = (desc.Width * 4) as usize;
                 let height = desc.Height as usize;
 
-                // Check if we need a frame copy for the recording session
-                let needs_recording_copy = {
-                    let state = RECORDING_STATE.lock().unwrap();
-                    state.session.is_some()
-                };
-
                 if src_stride == dst_stride {
                     let data = unsafe {
                         std::slice::from_raw_parts(
@@ -346,15 +340,14 @@ impl SwapChainProcessor {
                     };
                     resources.shm_writer.write_frame(data);
 
-                    if needs_recording_copy {
-                        let state = RECORDING_STATE.lock().unwrap();
-                        if let Some(ref session) = state.session {
-                            session.try_send_frame(crate::recording::Frame {
-                                bgra_data: data.to_vec(),
-                                width: desc.Width,
-                                height: desc.Height,
-                            });
-                        }
+                    // Single lock: check session and send frame in one acquisition
+                    let state = RECORDING_STATE.lock().unwrap();
+                    if let Some(ref session) = state.session {
+                        session.try_send_frame(crate::recording::Frame {
+                            bgra_data: data.to_vec(),
+                            width: desc.Width,
+                            height: desc.Height,
+                        });
                     }
                 } else {
                     let mut frame_buf = vec![0u8; dst_stride * height];
@@ -370,15 +363,14 @@ impl SwapChainProcessor {
                     }
                     resources.shm_writer.write_frame(&frame_buf);
 
-                    if needs_recording_copy {
-                        let state = RECORDING_STATE.lock().unwrap();
-                        if let Some(ref session) = state.session {
-                            session.try_send_frame(crate::recording::Frame {
-                                bgra_data: frame_buf,
-                                width: desc.Width,
-                                height: desc.Height,
-                            });
-                        }
+                    // Single lock: check session and send frame in one acquisition
+                    let state = RECORDING_STATE.lock().unwrap();
+                    if let Some(ref session) = state.session {
+                        session.try_send_frame(crate::recording::Frame {
+                            bgra_data: frame_buf,
+                            width: desc.Width,
+                            height: desc.Height,
+                        });
                     }
                 }
 

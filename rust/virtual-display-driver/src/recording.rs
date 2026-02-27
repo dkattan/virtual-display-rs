@@ -100,18 +100,26 @@ impl RecordingSession {
     /// Stop the recording and return the result.
     /// Blocks until the encoder thread finishes and the MP4 is finalized.
     pub fn stop(mut self) -> Option<RecordingResult> {
+        self.shutdown()
+    }
+
+    /// Internal shutdown logic shared by `stop()` and `Drop`.
+    fn shutdown(&mut self) -> Option<RecordingResult> {
         let sent = self.frames_sent.load(Ordering::Relaxed);
         let dropped = self.frames_dropped.load(Ordering::Relaxed);
         trace_log(&format!(
             "RecordingSession stopping: sent={sent} dropped={dropped}"
         ));
 
-        // Signal stop and drop the sender to unblock the receiver
+        // Signal stop to unblock the encoder's recv_timeout loop
         self.stop_signal.store(true, Ordering::Release);
-        drop(self.frame_tx);
 
-        // Join the encoder thread
+        // Join the encoder thread (if not already taken by a previous call)
         if let Some(handle) = self.encoder_thread.take() {
+            // Drop the sender to unblock the receiver if it's waiting
+            // We need a way to drop frame_tx here. Since we can't move out of &mut self,
+            // we'll rely on the stop_signal + recv_timeout to unblock the thread.
+            // The Sender will be dropped when self is dropped (after shutdown returns).
             match handle.join() {
                 Ok(result) => return result,
                 Err(e) => {
@@ -121,6 +129,16 @@ impl RecordingSession {
         }
 
         None
+    }
+}
+
+impl Drop for RecordingSession {
+    fn drop(&mut self) {
+        // Ensure the encoder thread is signaled and joined on abnormal teardown
+        self.stop_signal.store(true, Ordering::Release);
+        if let Some(handle) = self.encoder_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
