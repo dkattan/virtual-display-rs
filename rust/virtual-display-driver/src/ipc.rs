@@ -165,15 +165,18 @@ async fn process_message(
 
                 DriverCommand::StopRecording => {
                     crate::swap_chain_processor::trace_log("IPC: StopRecording");
-                    let mut state = RECORDING_STATE.lock().unwrap();
-                    state.active = false;
-                    state.monitor_ids.clear();
 
-                    // Stop recording session and send result
-                    if let Some(session) = state.session.take() {
-                        // Drop lock before blocking on encoder thread join
-                        drop(state);
+                    // Take session out of state in a limited scope so the
+                    // MutexGuard is dropped before any .await
+                    let session = {
+                        let mut state = RECORDING_STATE.lock().unwrap();
+                        state.active = false;
+                        state.monitor_ids.clear();
+                        state.session.take()
+                    };
 
+                    // Stop recording session and send result (lock is dropped)
+                    if let Some(session) = session {
                         let result = session.stop();
                         if let Some(result) = result {
                             let reply = ReplyCommand::RecordingFinished {
