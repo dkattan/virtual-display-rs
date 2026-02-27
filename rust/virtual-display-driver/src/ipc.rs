@@ -28,6 +28,7 @@ use windows::Win32::{
 };
 
 use crate::context::DeviceContext;
+use crate::recording::{RecordingConfig, RecordingSession};
 
 pub static ADAPTER: OnceLock<AdapterObject> = OnceLock::new();
 pub static MONITOR_MODES: LazyLock<Mutex<Vec<MonitorObject>>> =
@@ -35,10 +36,20 @@ pub static MONITOR_MODES: LazyLock<Mutex<Vec<MonitorObject>>> =
 pub static RECORDING_STATE: LazyLock<Mutex<RecordingState>> =
     LazyLock::new(|| Mutex::new(RecordingState::default()));
 
-#[derive(Debug, Default)]
 pub struct RecordingState {
     pub active: bool,
     pub monitor_ids: HashSet<u32>,
+    pub session: Option<RecordingSession>,
+}
+
+impl Default for RecordingState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            monitor_ids: HashSet::new(),
+            session: None,
+        }
+    }
 }
 
 impl RecordingState {
@@ -122,16 +133,33 @@ async fn process_message(
                     _ = tx.send((id, Vec::new()));
                 }
 
-                DriverCommand::StartRecording { monitor_ids, output_path: _output_path, fps: _fps } => {
+                DriverCommand::StartRecording { monitor_ids, output_path, fps } => {
                     crate::swap_chain_processor::trace_log(&format!(
-                        "IPC: StartRecording monitor_ids={monitor_ids:?}"
+                        "IPC: StartRecording monitor_ids={monitor_ids:?} output_path={output_path:?} fps={fps:?}"
                     ));
                     let mut state = RECORDING_STATE.lock().unwrap();
+
+                    // Stop any existing recording first
+                    if let Some(old_session) = state.session.take() {
+                        crate::swap_chain_processor::trace_log("IPC: Stopping previous recording");
+                        let _ = old_session.stop();
+                    }
+
                     state.active = true;
                     state.monitor_ids = monitor_ids.into_iter().collect();
+
+                    // Start MP4 recording if output path provided
+                    if let Some(path) = output_path {
+                        let config = RecordingConfig {
+                            output_path: path,
+                            fps: fps.unwrap_or(5),
+                        };
+                        state.session = Some(RecordingSession::start(config));
+                    }
+
                     crate::swap_chain_processor::trace_log(&format!(
-                        "IPC: RecordingState now active={}, monitors={:?}",
-                        state.active, state.monitor_ids
+                        "IPC: RecordingState now active={}, monitors={:?}, has_session={}",
+                        state.active, state.monitor_ids, state.session.is_some()
                     ));
                 }
 
@@ -140,6 +168,26 @@ async fn process_message(
                     let mut state = RECORDING_STATE.lock().unwrap();
                     state.active = false;
                     state.monitor_ids.clear();
+
+                    // Stop recording session and send result
+                    if let Some(session) = state.session.take() {
+                        // Drop lock before blocking on encoder thread join
+                        drop(state);
+
+                        let result = session.stop();
+                        if let Some(result) = result {
+                            let reply = ReplyCommand::RecordingFinished {
+                                path: result.path,
+                                frames: result.frames,
+                                duration_ms: result.duration_ms,
+                            };
+
+                            if let Ok(mut data) = serde_json::to_string(&reply) {
+                                data.push(EOF);
+                                let _ = server.write_all(data.as_bytes()).await;
+                            }
+                        }
+                    }
                 }
 
                 _ => (),
