@@ -1,0 +1,32 @@
+[package]
+name = "dxgi-capture"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dxgi-capture"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "io-util", "sync", "time"] }
+
+[dependencies.windows]
+version = "0.58.0"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_Devices_Display",
+    "Win32_Security",
+]

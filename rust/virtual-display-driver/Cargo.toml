@@ -26,6 +26,9 @@ tokio = { version = "1.42.0", features = [
     "io-util",
     "sync",
 ] }
+openh264 = { version = "=0.6.5", features = ["source"] }
+muxide = "0.1"
+crossbeam-channel = "0.5"
 
 [dependencies.windows]
 version = "0.58.0"
@@ -34,9 +37,12 @@ features = [
     "Win32_Security",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ]
 
 [build-dependencies]

@@ -7,6 +7,9 @@ mod edid;
 mod entry;
 mod ipc;
 mod panic;
+mod encoder;
+mod recording;
+mod shared_memory;
 mod swap_chain_processor;
 
 use wdf_umdf_sys::{NTSTATUS, PUNICODE_STRING, PVOID};

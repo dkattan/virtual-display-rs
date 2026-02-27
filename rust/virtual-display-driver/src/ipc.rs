@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     mem::size_of,
     ptr::{addr_of_mut, NonNull},
     sync::{LazyLock, Mutex, OnceLock},
@@ -6,8 +7,8 @@ use std::{
 };
 
 use driver_ipc::{
-    Dimen, DriverCommand, EventCommand, Mode, Monitor, RefreshRate, ReplyCommand, RequestCommand,
-    ServerCommand,
+    Dimen, DriverCommand, EventCommand, Mode, Monitor, RefreshRate, ReplyCommand,
+    RequestCommand, ServerCommand,
 };
 use log::{error, warn};
 use tokio::{
@@ -27,10 +28,43 @@ use windows::Win32::{
 };
 
 use crate::context::DeviceContext;
+use crate::recording::{RecordingConfig, RecordingSession};
 
 pub static ADAPTER: OnceLock<AdapterObject> = OnceLock::new();
 pub static MONITOR_MODES: LazyLock<Mutex<Vec<MonitorObject>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+pub static RECORDING_STATE: LazyLock<Mutex<RecordingState>> =
+    LazyLock::new(|| Mutex::new(RecordingState::default()));
+
+pub struct RecordingState {
+    pub active: bool,
+    pub monitor_ids: HashSet<u32>,
+    pub session: Option<RecordingSession>,
+}
+
+impl Default for RecordingState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            monitor_ids: HashSet::new(),
+            session: None,
+        }
+    }
+}
+
+impl RecordingState {
+    pub fn is_recording(&self, monitor_id: u32) -> bool {
+        self.active && (self.monitor_ids.is_empty() || self.monitor_ids.contains(&monitor_id))
+    }
+
+    pub fn shm_names(&self) -> Vec<String> {
+        let lock = MONITOR_MODES.lock().unwrap();
+        lock.iter()
+            .filter(|m| self.is_recording(m.data.id))
+            .map(|m| format!("Global\\VDD_Frame_{}", m.data.id))
+            .collect()
+    }
+}
 
 #[derive(Debug)]
 pub struct AdapterObject(pub NonNull<IDDCX_ADAPTER__>);
@@ -67,9 +101,16 @@ async fn process_message(
             continue;
         };
 
+        // Strip UTF-8 BOM if present (PowerShell StreamWriter adds it)
+        let msg = msg.trim_start_matches('\u{FEFF}');
+
         let Ok(command) = serde_json::from_str::<ServerCommand>(msg) else {
+            crate::swap_chain_processor::trace_log(&format!(
+                "IPC: failed to deserialize message: {msg}"
+            ));
             continue;
         };
+        crate::swap_chain_processor::trace_log(&format!("IPC: received command: {command:?}"));
 
         match command {
             // driver commands
@@ -90,6 +131,66 @@ async fn process_message(
                 DriverCommand::RemoveAll => {
                     remove_all();
                     _ = tx.send((id, Vec::new()));
+                }
+
+                DriverCommand::StartRecording { monitor_ids, output_path, fps } => {
+                    crate::swap_chain_processor::trace_log(&format!(
+                        "IPC: StartRecording monitor_ids={monitor_ids:?} output_path={output_path:?} fps={fps:?}"
+                    ));
+                    let mut state = RECORDING_STATE.lock().unwrap();
+
+                    // Stop any existing recording first
+                    if let Some(old_session) = state.session.take() {
+                        crate::swap_chain_processor::trace_log("IPC: Stopping previous recording");
+                        let _ = old_session.stop();
+                    }
+
+                    state.active = true;
+                    state.monitor_ids = monitor_ids.into_iter().collect();
+
+                    // Start MP4 recording if output path provided
+                    if let Some(path) = output_path {
+                        let config = RecordingConfig {
+                            output_path: path,
+                            fps: fps.unwrap_or(5),
+                        };
+                        state.session = Some(RecordingSession::start(config));
+                    }
+
+                    crate::swap_chain_processor::trace_log(&format!(
+                        "IPC: RecordingState now active={}, monitors={:?}, has_session={}",
+                        state.active, state.monitor_ids, state.session.is_some()
+                    ));
+                }
+
+                DriverCommand::StopRecording => {
+                    crate::swap_chain_processor::trace_log("IPC: StopRecording");
+
+                    // Take session out of state in a limited scope so the
+                    // MutexGuard is dropped before any .await
+                    let session = {
+                        let mut state = RECORDING_STATE.lock().unwrap();
+                        state.active = false;
+                        state.monitor_ids.clear();
+                        state.session.take()
+                    };
+
+                    // Stop recording session and send result (lock is dropped)
+                    if let Some(session) = session {
+                        let result = session.stop();
+                        if let Some(result) = result {
+                            let reply = ReplyCommand::RecordingFinished {
+                                path: result.path,
+                                frames: result.frames,
+                                duration_ms: result.duration_ms,
+                            };
+
+                            if let Ok(mut data) = serde_json::to_string(&reply) {
+                                data.push(EOF);
+                                let _ = server.write_all(data.as_bytes()).await;
+                            }
+                        }
+                    }
                 }
 
                 _ => (),
@@ -114,6 +215,30 @@ async fn process_message(
 
                 if server.write_all(data.as_bytes()).await.is_err() {
                     // a server error means we should completely stop trying
+                    return Err(());
+                }
+            }
+
+            ServerCommand::Request(RequestCommand::RecordingState) => {
+                let mut data = {
+                    let state = RECORDING_STATE.lock().unwrap();
+                    let command = ReplyCommand::RecordingState {
+                        active: state.active,
+                        monitor_ids: state.monitor_ids.iter().copied().collect(),
+                        shm_names: state.shm_names(),
+                    };
+
+                    let Ok(serialized) = serde_json::to_string(&command) else {
+                        error!("Command::Request - failed to serialize recording state reply");
+                        break;
+                    };
+
+                    serialized
+                };
+
+                data.push(EOF);
+
+                if server.write_all(data.as_bytes()).await.is_err() {
                     return Err(());
                 }
             }
