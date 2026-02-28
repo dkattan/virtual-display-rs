@@ -165,6 +165,25 @@ impl DriverClient {
         self.client.notify(&self.state).await
     }
 
+    /// Start recording frames from specified monitors.
+    ///
+    /// If `monitor_ids` is empty, all monitors will be recorded.
+    pub async fn start_recording(&self, monitor_ids: Vec<Id>) -> Result<(), error::SendError> {
+        self.client.start_recording(monitor_ids).await
+    }
+
+    /// Stop recording frames.
+    pub async fn stop_recording(&self) -> Result<(), error::SendError> {
+        self.client.stop_recording().await
+    }
+
+    /// Request the current recording state from the driver.
+    pub async fn request_recording_state(
+        &self,
+    ) -> Result<(bool, Vec<Id>, Vec<String>), error::RequestError> {
+        self.client.request_recording_state().await
+    }
+
     /// Find the monitor with the given ID.
     ///
     /// Note: Client state might be stale. To synchronize with the driver,

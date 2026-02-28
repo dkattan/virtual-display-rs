@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(*)",
+      "WebFetch(*)",
+      "Bash(git clone:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo search:*)",
+      "Bash(rustc:*)"
+    ]
+  }
+}

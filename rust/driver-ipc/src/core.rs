@@ -66,6 +66,12 @@ pub enum ReplyCommand {
         monitor_ids: Vec<Id>,
         shm_names: Vec<String>,
     },
+    // Acknowledgment that recording has started
+    RecordingStarted {
+        active: bool,
+        monitor_ids: Vec<Id>,
+        has_session: bool,
+    },
     // Notification that recording has finished with stats
     RecordingFinished {
         path: String,

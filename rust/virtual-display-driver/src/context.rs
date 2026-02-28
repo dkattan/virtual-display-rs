@@ -7,17 +7,20 @@ use std::{
 use anyhow::anyhow;
 use log::{error, warn};
 use wdf_umdf::{
-    IddCxAdapterInitAsync, IddCxError, IddCxMonitorArrival, IddCxMonitorCreate,
-    IddCxMonitorSetupHardwareCursor, WdfError, WdfObjectDelete, WDF_DECLARE_CONTEXT_TYPE,
+    IddCxAdapterInitAsync, IddCxError, IddCxMonitorArrival,
+    IddCxMonitorCreate, IddCxMonitorSetupHardwareCursor, WdfError, WdfObjectDelete,
+    WDF_DECLARE_CONTEXT_TYPE,
 };
 use wdf_umdf_sys::{
-    DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, HANDLE, IDARG_IN_ADAPTER_INIT, IDARG_IN_MONITORCREATE,
-    IDARG_IN_SETUP_HWCURSOR, IDARG_OUT_ADAPTER_INIT, IDARG_OUT_MONITORARRIVAL,
-    IDARG_OUT_MONITORCREATE, IDDCX_ADAPTER, IDDCX_ADAPTER_CAPS, IDDCX_CURSOR_CAPS,
-    IDDCX_ENDPOINT_DIAGNOSTIC_INFO, IDDCX_ENDPOINT_VERSION, IDDCX_FEATURE_IMPLEMENTATION,
-    IDDCX_MONITOR, IDDCX_MONITOR_DESCRIPTION, IDDCX_MONITOR_DESCRIPTION_TYPE, IDDCX_MONITOR_INFO,
-    IDDCX_SWAPCHAIN, IDDCX_TRANSMISSION_TYPE, IDDCX_XOR_CURSOR_SUPPORT, LUID, NTSTATUS, WDFDEVICE,
-    WDFOBJECT, WDF_OBJECT_ATTRIBUTES,
+    DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY,
+    HANDLE, IDARG_IN_ADAPTER_INIT,
+    IDARG_IN_MONITORCREATE, IDARG_IN_SETUP_HWCURSOR, IDARG_OUT_ADAPTER_INIT,
+    IDARG_OUT_MONITORARRIVAL, IDARG_OUT_MONITORCREATE, IDDCX_ADAPTER, IDDCX_ADAPTER_CAPS,
+    IDDCX_CURSOR_CAPS, IDDCX_ENDPOINT_DIAGNOSTIC_INFO,
+    IDDCX_ENDPOINT_VERSION, IDDCX_FEATURE_IMPLEMENTATION, IDDCX_MONITOR,
+    IDDCX_MONITOR_DESCRIPTION, IDDCX_MONITOR_DESCRIPTION_TYPE, IDDCX_MONITOR_INFO,
+    IDDCX_SWAPCHAIN, IDDCX_TRANSMISSION_TYPE, IDDCX_XOR_CURSOR_SUPPORT, LUID, NTSTATUS,
+    WDFDEVICE, WDFOBJECT, WDF_OBJECT_ATTRIBUTES,
 };
 use windows::{
     core::{s, w, GUID},
@@ -47,6 +50,7 @@ unsafe impl Sync for DeviceContext {}
 #[allow(unused)]
 pub struct MonitorContext {
     device: IDDCX_MONITOR,
+    monitor_id: u32,
     swap_chain_processor: Option<SwapChainProcessor>,
 }
 
@@ -144,6 +148,7 @@ impl DeviceContext {
     }
 
     pub fn create_monitor(&mut self, index: u32) -> Result<(), ContextError> {
+        crate::swap_chain_processor::trace_log(&format!("create_monitor: index={index}"));
         let mut attr =
             WDF_OBJECT_ATTRIBUTES::init_context_type(unsafe { MonitorContext::get_type_info() });
 
@@ -207,7 +212,7 @@ impl DeviceContext {
         }
 
         unsafe {
-            let context = MonitorContext::new(monitor_create_out.MonitorObject);
+            let context = MonitorContext::new(monitor_create_out.MonitorObject, index);
             context.init(monitor_create_out.MonitorObject as WDFOBJECT)?;
         }
 
@@ -218,15 +223,27 @@ impl DeviceContext {
         unsafe {
             IddCxMonitorArrival(monitor_create_out.MonitorObject, &mut arrival_out)?;
         }
+        crate::swap_chain_processor::trace_log(&format!(
+            "create_monitor: IddCxMonitorArrival OK for index={index}"
+        ));
+
+        // NOTE: Path activation for console IDD drivers must come from user-mode
+        // SetDisplayConfig (CCD API). IddCxAdapterDisplayConfigUpdate is for remote
+        // drivers only and returns STATUS_NOT_SUPPORTED for console IDD.
+        // The vdd-user-session-service or ImmyBot agent should call
+        // SetDisplayConfig(0, NULL, 0, NULL, SDC_APPLY | SDC_TOPOLOGY_EXTEND)
+        // after the monitor arrives to activate the display path.
 
         Ok(())
     }
+
 }
 
 impl MonitorContext {
-    pub fn new(device: IDDCX_MONITOR) -> Self {
+    pub fn new(device: IDDCX_MONITOR, monitor_id: u32) -> Self {
         Self {
             device,
+            monitor_id,
             swap_chain_processor: None,
         }
     }
@@ -237,6 +254,11 @@ impl MonitorContext {
         render_adapter: LUID,
         new_frame_event: HANDLE,
     ) {
+        crate::swap_chain_processor::trace_log(&format!(
+            "assign_swap_chain called for monitor {}",
+            self.monitor_id
+        ));
+
         // drop processing thread
         drop(self.swap_chain_processor.take());
 
@@ -249,7 +271,12 @@ impl MonitorContext {
         let device = Direct3DDevice::init(luid);
 
         if let Ok(device) = device {
-            let mut processor = SwapChainProcessor::new();
+            crate::swap_chain_processor::trace_log(&format!(
+                "D3D device initialized OK for monitor {}, starting SwapChainProcessor",
+                self.monitor_id
+            ));
+
+            let mut processor = SwapChainProcessor::new(self.monitor_id);
 
             processor.run(swap_chain, device, new_frame_event);
 
@@ -257,6 +284,11 @@ impl MonitorContext {
 
             self.setup_hw_cursor();
         } else {
+            crate::swap_chain_processor::trace_log(&format!(
+                "D3D device init FAILED for monitor {}: {:?}",
+                self.monitor_id, device
+            ));
+
             // It's important to delete the swap-chain if D3D initialization fails, so that the OS knows to generate a new
             // swap-chain and try again.
 
@@ -267,6 +299,10 @@ impl MonitorContext {
     }
 
     pub fn unassign_swap_chain(&mut self) {
+        crate::swap_chain_processor::trace_log(&format!(
+            "unassign_swap_chain called for monitor {}",
+            self.monitor_id
+        ));
         self.swap_chain_processor.take();
     }
 

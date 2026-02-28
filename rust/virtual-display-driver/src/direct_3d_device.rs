@@ -35,7 +35,7 @@ pub struct Direct3DDevice {
     _dxgi_factory: IDXGIFactory5,
     _adapter: IDXGIAdapter1,
     pub device: ID3D11Device,
-    _device_context: ID3D11DeviceContext,
+    pub device_context: ID3D11DeviceContext,
 }
 
 impl Direct3DDevice {
@@ -71,7 +71,7 @@ impl Direct3DDevice {
             _dxgi_factory: dxgi_factory,
             _adapter: adapter,
             device,
-            _device_context: device_context,
+            device_context,
         })
     }
 }

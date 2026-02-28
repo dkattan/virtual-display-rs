@@ -26,6 +26,7 @@ pub extern "C-unwind" fn adapter_init_finished(
     adapter_object: *mut IDDCX_ADAPTER__,
     _p_in_args: *const IDARG_IN_ADAPTER_INIT_FINISHED,
 ) -> NTSTATUS {
+    crate::swap_chain_processor::trace_log("CALLBACK: adapter_init_finished");
     let Some(adapter_ptr) = NonNull::new(adapter_object) else {
         error!("Adapter ptr was null");
         return NTSTATUS::STATUS_INVALID_ADDRESS;
@@ -46,6 +47,7 @@ pub extern "C-unwind" fn device_d0_entry(
     device: WDFDEVICE,
     _previous_state: WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
+    crate::swap_chain_processor::trace_log("CALLBACK: device_d0_entry");
     let status: NTSTATUS = unsafe {
         DeviceContext::get_mut(device.cast(), |context| {
             if let Err(e) = context.init_adapter() {
@@ -104,6 +106,7 @@ pub extern "C-unwind" fn parse_monitor_description(
     p_in_args: *const IDARG_IN_PARSEMONITORDESCRIPTION,
     p_out_args: *mut IDARG_OUT_PARSEMONITORDESCRIPTION,
 ) -> NTSTATUS {
+    crate::swap_chain_processor::trace_log("CALLBACK: parse_monitor_description");
     let in_args = unsafe { &*p_in_args };
     let out_args = unsafe { &mut *p_out_args };
 
@@ -287,8 +290,23 @@ pub extern "C-unwind" fn monitor_query_modes(
 
 pub extern "C-unwind" fn adapter_commit_modes(
     _adapter_object: *mut IDDCX_ADAPTER__,
-    _p_in_args: *const IDARG_IN_COMMITMODES,
+    p_in_args: *const IDARG_IN_COMMITMODES,
 ) -> NTSTATUS {
+    let in_args = unsafe { &*p_in_args };
+    crate::swap_chain_processor::trace_log(&format!(
+        "CALLBACK[BUILD-CANARY-20260227A]: adapter_commit_modes PathCount={}",
+        in_args.PathCount
+    ));
+    for i in 0..in_args.PathCount {
+        let path = unsafe { &*in_args.pPaths.add(i as usize) };
+        let is_active = (path.Flags.0 & 2) != 0; // IDDCX_PATH_FLAGS_ACTIVE = 2
+        let is_changed = (path.Flags.0 & 1) != 0; // IDDCX_PATH_FLAGS_CHANGED = 1
+        crate::swap_chain_processor::trace_log(&format!(
+            "  Path[{i}]: MonitorObject={:?} Flags=0x{:X} active={is_active} changed={is_changed}",
+            path.MonitorObject as *const _,
+            path.Flags.0
+        ));
+    }
     NTSTATUS::STATUS_SUCCESS
 }
 
@@ -296,6 +314,7 @@ pub extern "C-unwind" fn assign_swap_chain(
     monitor_object: *mut IDDCX_MONITOR__,
     p_in_args: *const IDARG_IN_SETSWAPCHAIN,
 ) -> NTSTATUS {
+    crate::swap_chain_processor::trace_log("CALLBACK: assign_swap_chain entered");
     let p_in_args = unsafe { &*p_in_args };
 
     unsafe {

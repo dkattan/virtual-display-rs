@@ -83,6 +83,116 @@ const BUFFER_SIZE: u32 = 4096;
 // EOT
 const EOF: char = '\x04';
 
+/// DEADEND: SendInput from UMDF driver process (Session 0) does not work.
+/// OpenInputDesktop fails with ERROR_INVALID_FUNCTION (0x80070001) because the
+/// UMDF host process has no interactive desktop. SendInput returns 0.
+/// The display wake must be performed by the IPC client (running in user session).
+///
+/// Spawns a thread that attempts a Space keypress to wake the display.
+/// Left in for diagnostic logging — will log the failure to VDD_trace.log.
+fn send_wake_keypress() {
+    crate::swap_chain_processor::trace_log("IPC: Spawning thread to send wake keypress...");
+
+    thread::spawn(|| {
+        // Small delay to let recording state settle before waking display
+        thread::sleep(std::time::Duration::from_millis(500));
+
+        send_wake_keypress_inner()
+    });
+}
+
+fn send_wake_keypress_inner() {
+    use std::mem::{size_of, zeroed};
+    use windows::Win32::{
+        System::StationsAndDesktops::{
+            CloseDesktop, GetThreadDesktop, OpenInputDesktop, SetThreadDesktop,
+            DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
+        },
+        System::Threading::GetCurrentThreadId,
+        UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_SPACE,
+        },
+    };
+
+    // Save the current thread's desktop so we can restore it
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let original_desktop = unsafe { GetThreadDesktop(thread_id) };
+
+    // Try to switch to the input desktop (the one receiving user input).
+    // This is critical when the driver host runs in Session 0 or on a different desktop.
+    // dwFlags=0, fInherit=false, dwDesiredAccess=GENERIC_ALL (0x10000000)
+    let switched_desktop = match unsafe {
+        OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(0x10000000),
+        )
+    } {
+        Ok(hdesk) => {
+            crate::swap_chain_processor::trace_log("IPC: OpenInputDesktop succeeded");
+            match unsafe { SetThreadDesktop(hdesk) } {
+                Ok(()) => {
+                    crate::swap_chain_processor::trace_log("IPC: SetThreadDesktop succeeded");
+                    Some(hdesk)
+                }
+                Err(e) => {
+                    crate::swap_chain_processor::trace_log(&format!(
+                        "IPC: SetThreadDesktop failed: {e}"
+                    ));
+                    let _ = unsafe { CloseDesktop(hdesk) };
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            crate::swap_chain_processor::trace_log(&format!(
+                "IPC: OpenInputDesktop failed: {e} — will try SendInput anyway"
+            ));
+            None
+        }
+    };
+
+    // Send Space key down + up
+    let mut inputs: [INPUT; 2] = unsafe { zeroed() };
+
+    inputs[0].r#type = INPUT_KEYBOARD;
+    inputs[0].Anonymous.ki = unsafe {
+        KEYBDINPUT {
+            wVk: VK_SPACE,
+            ..zeroed()
+        }
+    };
+
+    inputs[1].r#type = INPUT_KEYBOARD;
+    inputs[1].Anonymous.ki = unsafe {
+        KEYBDINPUT {
+            wVk: VK_SPACE,
+            dwFlags: KEYEVENTF_KEYUP,
+            ..zeroed()
+        }
+    };
+
+    let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+    crate::swap_chain_processor::trace_log(&format!(
+        "IPC: SendInput returned {sent} (expected 2)"
+    ));
+
+    if sent == 0 {
+        let err = windows::core::Error::from_win32();
+        crate::swap_chain_processor::trace_log(&format!(
+            "IPC: SendInput last error: {err}"
+        ));
+    }
+
+    // Restore original desktop and clean up
+    if let Some(hdesk) = switched_desktop {
+        if let Ok(orig) = original_desktop {
+            let _ = unsafe { SetThreadDesktop(orig) };
+        }
+        let _ = unsafe { CloseDesktop(hdesk) };
+    }
+}
+
 // message processor
 async fn process_message(
     id: usize,
@@ -97,20 +207,30 @@ async fn process_message(
         let sidx = start;
         start = eidx + 1;
 
+        crate::swap_chain_processor::trace_log(&format!(
+            "IPC: Processing message bytes [{sidx}..{eidx}] ({} bytes)", eidx - sidx
+        ));
+
         let Ok(msg) = std::str::from_utf8(&buf[sidx..eidx]) else {
+            crate::swap_chain_processor::trace_log(&format!(
+                "IPC: UTF-8 decode failed for bytes [{sidx}..{eidx}]"
+            ));
             continue;
         };
 
         // Strip UTF-8 BOM if present (PowerShell StreamWriter adds it)
         let msg = msg.trim_start_matches('\u{FEFF}');
+        crate::swap_chain_processor::trace_log(&format!(
+            "IPC: Raw message text ({} chars): {msg}", msg.len()
+        ));
 
         let Ok(command) = serde_json::from_str::<ServerCommand>(msg) else {
             crate::swap_chain_processor::trace_log(&format!(
-                "IPC: failed to deserialize message: {msg}"
+                "IPC: DESERIALIZE FAILED for message: {msg}"
             ));
             continue;
         };
-        crate::swap_chain_processor::trace_log(&format!("IPC: received command: {command:?}"));
+        crate::swap_chain_processor::trace_log(&format!("IPC: Deserialized command: {command:?}"));
 
         match command {
             // driver commands
@@ -137,30 +257,67 @@ async fn process_message(
                     crate::swap_chain_processor::trace_log(&format!(
                         "IPC: StartRecording monitor_ids={monitor_ids:?} output_path={output_path:?} fps={fps:?}"
                     ));
-                    let mut state = RECORDING_STATE.lock().unwrap();
 
-                    // Stop any existing recording first
-                    if let Some(old_session) = state.session.take() {
-                        crate::swap_chain_processor::trace_log("IPC: Stopping previous recording");
-                        let _ = old_session.stop();
+                    // Scoped block so MutexGuard is dropped before any .await
+                    let reply = {
+                        let mut state = RECORDING_STATE.lock().unwrap();
+                        crate::swap_chain_processor::trace_log("IPC: StartRecording acquired RECORDING_STATE lock");
+
+                        // Stop any existing recording first
+                        if let Some(old_session) = state.session.take() {
+                            crate::swap_chain_processor::trace_log("IPC: Stopping previous recording");
+                            let _ = old_session.stop();
+                            crate::swap_chain_processor::trace_log("IPC: Previous recording stopped");
+                        }
+
+                        state.active = true;
+                        state.monitor_ids = monitor_ids.into_iter().collect();
+                        crate::swap_chain_processor::trace_log(&format!(
+                            "IPC: Set active=true, monitor_ids={:?}", state.monitor_ids
+                        ));
+
+                        // Start MP4 recording if output path provided
+                        if let Some(path) = output_path {
+                            crate::swap_chain_processor::trace_log(&format!(
+                                "IPC: Creating RecordingSession path={path:?} fps={fps:?}"
+                            ));
+                            let config = RecordingConfig {
+                                output_path: path,
+                                fps: fps.unwrap_or(5),
+                            };
+                            state.session = Some(RecordingSession::start(config));
+                            crate::swap_chain_processor::trace_log("IPC: RecordingSession created");
+                        } else {
+                            crate::swap_chain_processor::trace_log("IPC: No output_path — no RecordingSession created");
+                        }
+
+                        crate::swap_chain_processor::trace_log(&format!(
+                            "IPC: RecordingState now active={}, monitors={:?}, has_session={}",
+                            state.active, state.monitor_ids, state.session.is_some()
+                        ));
+
+                        ReplyCommand::RecordingStarted {
+                            active: state.active,
+                            monitor_ids: state.monitor_ids.iter().copied().collect(),
+                            has_session: state.session.is_some(),
+                        }
+                        // MutexGuard dropped here
+                    };
+
+                    if let Ok(mut data) = serde_json::to_string(&reply) {
+                        data.push(EOF);
+                        crate::swap_chain_processor::trace_log(&format!(
+                            "IPC: Sending RecordingStarted reply ({} bytes)", data.len()
+                        ));
+                        let _ = server.write_all(data.as_bytes()).await;
+                        crate::swap_chain_processor::trace_log("IPC: RecordingStarted reply sent");
+                    } else {
+                        crate::swap_chain_processor::trace_log("IPC: ERROR — failed to serialize RecordingStarted reply");
                     }
 
-                    state.active = true;
-                    state.monitor_ids = monitor_ids.into_iter().collect();
-
-                    // Start MP4 recording if output path provided
-                    if let Some(path) = output_path {
-                        let config = RecordingConfig {
-                            output_path: path,
-                            fps: fps.unwrap_or(5),
-                        };
-                        state.session = Some(RecordingSession::start(config));
-                    }
-
-                    crate::swap_chain_processor::trace_log(&format!(
-                        "IPC: RecordingState now active={}, monitors={:?}, has_session={}",
-                        state.active, state.monitor_ids, state.session.is_some()
-                    ));
+                    // Wake the display by sending a keypress — IddCx only activates
+                    // display paths when the display is awake
+                    send_wake_keypress();
                 }
 
                 DriverCommand::StopRecording => {
@@ -175,21 +332,35 @@ async fn process_message(
                         state.session.take()
                     };
 
-                    // Stop recording session and send result (lock is dropped)
-                    if let Some(session) = session {
-                        let result = session.stop();
-                        if let Some(result) = result {
-                            let reply = ReplyCommand::RecordingFinished {
+                    // Stop recording session and ALWAYS send a reply (even with 0 frames)
+                    let reply = if let Some(session) = session {
+                        match session.stop() {
+                            Some(result) => ReplyCommand::RecordingFinished {
                                 path: result.path,
                                 frames: result.frames,
                                 duration_ms: result.duration_ms,
-                            };
-
-                            if let Ok(mut data) = serde_json::to_string(&reply) {
-                                data.push(EOF);
-                                let _ = server.write_all(data.as_bytes()).await;
-                            }
+                            },
+                            None => ReplyCommand::RecordingFinished {
+                                path: String::new(),
+                                frames: 0,
+                                duration_ms: 0,
+                            },
                         }
+                    } else {
+                        ReplyCommand::RecordingFinished {
+                            path: String::new(),
+                            frames: 0,
+                            duration_ms: 0,
+                        }
+                    };
+
+                    crate::swap_chain_processor::trace_log(&format!(
+                        "IPC: StopRecording reply: {reply:?}"
+                    ));
+
+                    if let Ok(mut data) = serde_json::to_string(&reply) {
+                        data.push(EOF);
+                        let _ = server.write_all(data.as_bytes()).await;
                     }
                 }
 
@@ -285,6 +456,10 @@ pub fn startup() {
 
         // async time!
         let pipe_server = async {
+            crate::swap_chain_processor::trace_log(
+                "=== VDD CANARY 2026-02-27-B === Pipe server starting (tokio async loop, with SendInput wake)"
+            );
+
             let (tx, _rx) = broadcast::channel(1);
 
             let mut id = 0usize;
@@ -306,16 +481,21 @@ pub fn startup() {
                 };
 
                 if server.connect().await.is_err() {
+                    crate::swap_chain_processor::trace_log("IPC: server.connect() failed, retrying");
                     continue;
                 }
 
                 id += 1;
+                crate::swap_chain_processor::trace_log(&format!(
+                    "IPC: Client #{id} connected to pipe"
+                ));
 
                 let mut msg_buf: Vec<u8> = Vec::with_capacity(BUFFER_SIZE as usize);
                 let mut buf = vec![0; BUFFER_SIZE as usize];
                 let tx = tx.clone();
                 let mut rx = tx.subscribe();
 
+                let client_id = id;
                 task::spawn(async move {
                     loop {
                         tokio::select! {
@@ -323,9 +503,26 @@ pub fn startup() {
                                 match val {
                                     // 0 = no more data to read
                                     // or break on err
-                                    Ok(0) | Err(_) => break,
+                                    Ok(0) => {
+                                        crate::swap_chain_processor::trace_log(&format!(
+                                            "IPC: Client #{client_id} read returned 0 — disconnected"
+                                        ));
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        crate::swap_chain_processor::trace_log(&format!(
+                                            "IPC: Client #{client_id} read error: {e}"
+                                        ));
+                                        break;
+                                    }
 
-                                    Ok(size) => msg_buf.extend(&buf[..size]),
+                                    Ok(size) => {
+                                        crate::swap_chain_processor::trace_log(&format!(
+                                            "IPC: Client #{client_id} read {size} bytes, msg_buf total={}",
+                                            msg_buf.len() + size
+                                        ));
+                                        msg_buf.extend(&buf[..size]);
+                                    }
                                 }
 
                                 // get all eof boundary positions

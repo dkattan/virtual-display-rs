@@ -188,9 +188,9 @@ fn generate() {
     // IDDCX
     //
 
-    let mut iddcx_lib_dir = lib_um_dir.clone();
-    iddcx_lib_dir.push("iddcx");
-    iddcx_lib_dir.push(IDDCX_V);
+    let target = Target::default().to_string();
+    let iddcx_lib_dir =
+        get_sdk_path(DirectoryType::Library, &["um", &target, "iddcx", IDDCX_V]).unwrap();
 
     println!("cargo:rustc-link-search={}", iddcx_lib_dir.display());
 
@@ -265,5 +265,31 @@ fn generate() {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    let out_path = build_dir();
+    let bindings_file = out_path.join("umdf.rs");
+
+    // Skip bindgen regeneration if bindings already exist (avoids libclang dependency)
+    if bindings_file.exists() && env::var("FORCE_BINDGEN").is_err() {
+        // Still need to emit link directives
+        emit_link_directives();
+        return;
+    }
+
     generate();
+}
+
+fn emit_link_directives() {
+    let lib_um_dir = get_um_dir(DirectoryType::Library).unwrap();
+    println!("cargo:rustc-link-search={}", lib_um_dir.display());
+    println!("cargo:rerun-if-changed=c/wrapper.h");
+
+    let umdf_lib_dir = get_umdf_dir(DirectoryType::Library).unwrap();
+    println!("cargo:rustc-link-search={}", umdf_lib_dir.display());
+    println!("cargo:rustc-link-lib=static=WdfDriverStubUm");
+
+    let target = Target::default().to_string();
+    let iddcx_lib_dir =
+        get_sdk_path(DirectoryType::Library, &["um", &target, "iddcx", IDDCX_V]).unwrap();
+    println!("cargo:rustc-link-search={}", iddcx_lib_dir.display());
+    println!("cargo:rustc-link-lib=static=IddCxStub");
 }

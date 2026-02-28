@@ -138,9 +138,21 @@ extern "C-unwind" fn driver_add(
     }
 
     let Some(mut config) = IDD_CX_CLIENT_CONFIG::init() else {
+        crate::swap_chain_processor::trace_log("FATAL: IDD_CX_CLIENT_CONFIG::init() returned None");
         error!("Failed to create IDD_CX_CLIENT_CONFIG");
         return NTSTATUS::STATUS_NOT_FOUND;
     };
+
+    crate::swap_chain_processor::trace_log(&format!(
+        "driver_add: IDD_CX_CLIENT_CONFIG size={}, struct_size={}, assign_swapchain_offset={}",
+        config.Size,
+        std::mem::size_of::<IDD_CX_CLIENT_CONFIG>(),
+        {
+            let base = &config as *const _ as usize;
+            let field = &config.EvtIddCxMonitorAssignSwapChain as *const _ as usize;
+            field - base
+        }
+    ));
 
     config.EvtIddCxAdapterInitFinished = Some(adapter_init_finished);
 
@@ -151,12 +163,19 @@ extern "C-unwind" fn driver_add(
     config.EvtIddCxMonitorAssignSwapChain = Some(assign_swap_chain);
     config.EvtIddCxMonitorUnassignSwapChain = Some(unassign_swap_chain);
 
+    crate::swap_chain_processor::trace_log(&format!(
+        "driver_add: EvtIddCxMonitorAssignSwapChain = {:?}",
+        config.EvtIddCxMonitorAssignSwapChain.map(|f| f as usize)
+    ));
+
     let init_data = unsafe { &mut *init };
     let status = unsafe { IddCxDeviceInitConfig(init_data, &config) };
     if let Err(e) = status {
+        crate::swap_chain_processor::trace_log(&format!("IddCxDeviceInitConfig FAILED: {e:?}"));
         error!("Failed to init iddcx config: {e:?}");
         return e.into();
     }
+    crate::swap_chain_processor::trace_log("driver_add: IddCxDeviceInitConfig OK");
 
     let mut attributes =
         WDF_OBJECT_ATTRIBUTES::init_context_type(unsafe { DeviceContext::get_type_info() });
